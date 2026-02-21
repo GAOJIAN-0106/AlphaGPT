@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .config import ModelConfig
 from .ops import OPS_CONFIG
+from .factors import FeatureEngineer
 
 
 class NewtonSchulzLowRankDecay:
@@ -222,9 +223,17 @@ class AlphaGPT(nn.Module):
     def __init__(self):
         super().__init__()
         self.d_model = 64
-        self.features_list = ['RET', 'VOL', 'V_CHG', 'PV', 'TREND']
+        self.features_list = [
+            'RET', 'LIQ', 'PRESSURE', 'FOMO', 'DEV', 'LOG_VOL',
+            'VOL_CLUSTER', 'MOM_REV', 'REL_STR', 'HL_RANGE', 'CLOSE_POS', 'VOL_TREND',
+        ]
         self.ops_list = [cfg[0] for cfg in OPS_CONFIG]
-        
+
+        assert len(self.features_list) == FeatureEngineer.INPUT_DIM, (
+            f"AlphaGPT features_list has {len(self.features_list)} items "
+            f"but FeatureEngineer.INPUT_DIM = {FeatureEngineer.INPUT_DIM}"
+        )
+
         self.vocab = self.features_list + self.ops_list
         self.vocab_size = len(self.vocab)
         
