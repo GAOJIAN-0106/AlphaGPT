@@ -56,3 +56,15 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+# Weights & Biases
+wandb/
+
+# Training outputs
+best_*.json
+cv_results.json
+training_history.json
+portfolio_state.json
+
+# Claude Code
+.claude/
