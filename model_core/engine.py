@@ -9,22 +9,42 @@ import math
 
 from .config import ModelConfig
 from .data_loader import CryptoDataLoader
+try:
+    from .duckdb_loader import DuckDBDataLoader
+except ImportError:
+    DuckDBDataLoader = None
+
+
+def _default_loader_cls():
+    """Auto-select data loader based on DATA_SOURCE_MODE."""
+    if ModelConfig.ASSET_CLASS == 'futures' and DuckDBDataLoader is not None:
+        return DuckDBDataLoader
+    return CryptoDataLoader
 from .alphagpt import AlphaGPT, NewtonSchulzLowRankDecay, StableRankMonitor
 from .vm import StackVM
 from .backtest import MemeBacktest
 from .ensemble import FormulaEnsemble
+from .online_learner import OnlineLearner
 from .tracking import create_tracker
 from .temporal_cv import TimeSeriesCV, evaluate_formula_cv
 from .factors import FeatureEngineer
-from .ops import OPS_CONFIG
 
-# RPN stack effects per token — auto-derived from FeatureEngineer and OPS_CONFIG
-# Features: arity=0 (need nothing on stack), delta=+1 (push one value)
-# Operators: arity from OPS_CONFIG, delta = 1 - arity (pop arity, push 1 result)
-_n_features = FeatureEngineer.INPUT_DIM
-_op_arities = [cfg[2] for cfg in OPS_CONFIG]
-_ARITY = torch.tensor([0] * _n_features + _op_arities)
-_STACK_DELTA = torch.tensor([1] * _n_features + [1 - a for a in _op_arities])
+
+def _build_masking_tensors():
+    """Build RPN stack effect tensors from dynamic config.
+
+    Features: arity=0 (need nothing on stack), delta=+1 (push one value)
+    Operators: arity from ops config, delta = 1 - arity (pop arity, push 1 result)
+    """
+    n_feat = ModelConfig.get_feature_dim()
+    ops = ModelConfig.get_ops_config()
+    arities = [cfg[2] for cfg in ops]
+    arity = torch.tensor([0] * n_feat + arities)
+    delta = torch.tensor([1] * n_feat + [1 - a for a in arities])
+    return arity, delta
+
+
+_ARITY, _STACK_DELTA = _build_masking_tensors()
 
 class AlphaEngine:
     def __init__(self, use_lord_regularization=True, lord_decay_rate=1e-3, lord_num_iterations=5,
@@ -52,6 +72,8 @@ class AlphaEngine:
 
         if loader is not None:
             self.loader = loader
+        elif ModelConfig.ASSET_CLASS == 'futures' and DuckDBDataLoader is not None:
+            self.loader = DuckDBDataLoader()
         else:
             self.loader = CryptoDataLoader()
         # Skip load_data() if the loader already has data (e.g. pre-loaded)
@@ -70,7 +92,7 @@ class AlphaEngine:
         tracker_config = {
             "batch_size": ModelConfig.BATCH_SIZE,
             "train_steps": ModelConfig.TRAIN_STEPS,
-            "max_formula_len": ModelConfig.MAX_FORMULA_LEN,
+            "max_formula_len": ModelConfig.get_max_formula_len(),
             "seed": seed,
             "use_lord": use_lord_regularization,
             "lord_decay_rate": lord_decay_rate,
@@ -100,7 +122,9 @@ class AlphaEngine:
             self.rank_monitor = None
 
         self.vm = StackVM()
-        self.bt = MemeBacktest()
+        self.bt = MemeBacktest(position_mode='rank')
+        # Separate backtest for OOS evaluation — always uses full tx costs (tx_cost_scale=1.0)
+        self.bt_oos = MemeBacktest(position_mode='rank')
 
         # Cache action masking tensors on device (avoid repeated .to() in inner loop)
         self._arity_dev = _ARITY.to(ModelConfig.DEVICE)
@@ -110,7 +134,10 @@ class AlphaEngine:
         self.best_formula = None
         self.best_diagnostics = {}
         self.steps_without_improvement = 0
-        self.early_stop_patience = 500
+        self.early_stop_patience = 800
+
+        # Novelty tracking: set of formula skeletons seen so far
+        self._seen_skeletons = set()
         self.training_history = {
             'step': [],
             'avg_reward': [],
@@ -128,6 +155,49 @@ class AlphaEngine:
     def _get_base_factors(self, feat_tensor):
         """Extract raw returns (feature 0) as baseline for redundancy check."""
         return feat_tensor[:, 0, :]
+
+    def _formula_skeleton(self, formula):
+        """Convert formula to a skeleton: features→'F', ops→op_name. Used for novelty tracking."""
+        feat_offset = self.vm.feat_offset
+        parts = []
+        for t in formula:
+            t = int(t)
+            if t < feat_offset:
+                parts.append('F')
+            else:
+                parts.append(str(t))
+        return tuple(parts)
+
+    def _formula_structure_penalty(self, formula):
+        """Penalize degenerate formula structures: repeat tokens and low diversity.
+
+        Returns (penalty, bonus) tuple — both non-negative.
+        """
+        feat_offset = self.vm.feat_offset
+        feat_counts = {}
+        op_counts = {}
+
+        for token in formula:
+            t = int(token)
+            if t < feat_offset:
+                feat_counts[t] = feat_counts.get(t, 0) + 1
+            else:
+                op_counts[t] = op_counts.get(t, 0) + 1
+
+        # Repeat penalty: features used >2 times get -0.5 per extra, ops >3 times get -0.3 per extra
+        penalty = 0.0
+        for count in feat_counts.values():
+            if count > 2:
+                penalty += 0.5 * (count - 2)
+        for count in op_counts.values():
+            if count > 3:
+                penalty += 0.3 * (count - 3)
+
+        # Diversity bonus: +0.15 per unique feature used beyond 2, capped at +0.6
+        n_unique_feats = len(feat_counts)
+        bonus = min(0.6, max(0, n_unique_feats - 2) * 0.15)
+
+        return penalty, bonus
 
     def _evaluate_formula(self, formula, feat_tensor, raw_data, target_ret, base_factors):
         """Evaluate a formula with shaped rewards for partial failures."""
@@ -170,7 +240,18 @@ class AlphaEngine:
             formula_length=formula_len,
             base_factors=base_factors,
         )
-        return score.item()
+
+        # Apply structure penalty and diversity bonus
+        struct_penalty, div_bonus = self._formula_structure_penalty(formula)
+
+        # Novelty bonus: +0.3 if this formula skeleton hasn't been seen before
+        skeleton = self._formula_skeleton(formula)
+        novelty_bonus = 0.0
+        if skeleton not in self._seen_skeletons:
+            novelty_bonus = 0.3
+            self._seen_skeletons.add(skeleton)
+
+        return score.item() - struct_penalty + div_bonus + novelty_bonus
 
     def train(self):
         print("Starting Alpha Mining with OOS validation...")
@@ -184,6 +265,8 @@ class AlphaEngine:
         total_formulas = 0
 
         for step in pbar:
+            # No tx_cost curriculum — train with full costs for honest optimization
+
             bs = ModelConfig.BATCH_SIZE
             inp = torch.zeros((bs, 1), dtype=torch.long, device=ModelConfig.DEVICE)
 
@@ -192,12 +275,19 @@ class AlphaEngine:
             entropies = []
 
             stack_sizes = torch.zeros(bs, dtype=torch.long, device=ModelConfig.DEVICE)
+            # Track consecutive arity-3 ops per batch item (Phase 3: GATE limiter)
+            consec_arity3 = torch.zeros(bs, dtype=torch.long, device=ModelConfig.DEVICE)
+            max_consec_arity3 = 2
 
-            for step_idx in range(ModelConfig.MAX_FORMULA_LEN):
+            # Pre-compute which tokens are arity-3 (for masking)
+            _arity3_mask = (self._arity_dev == 3)  # [vocab]
+
+            _max_len = ModelConfig.get_max_formula_len()
+            for step_idx in range(_max_len):
                 logits, _, _ = self.model(inp)
 
                 # --- Action Masking ---
-                remaining = ModelConfig.MAX_FORMULA_LEN - 1 - step_idx
+                remaining = _max_len - 1 - step_idx
                 arity = self._arity_dev
                 delta = self._delta_dev
 
@@ -212,6 +302,10 @@ class AlphaEngine:
                 if remaining == 0:
                     valid &= (new_stack == 1)  # last step must end at 1
 
+                # Phase 3: Block arity-3 ops if consecutive limit reached
+                arity3_blocked = (consec_arity3 >= max_consec_arity3).unsqueeze(1)  # [bs, 1]
+                valid &= ~(arity3_blocked & _arity3_mask.unsqueeze(0))  # [bs, vocab]
+
                 # Apply mask
                 logits = logits.masked_fill(~valid, -1e9)
 
@@ -225,6 +319,10 @@ class AlphaEngine:
 
                 # Update stack sizes
                 stack_sizes = stack_sizes + delta[action]
+
+                # Update consecutive arity-3 counter
+                is_arity3 = _arity3_mask[action]  # [bs] bool
+                consec_arity3 = torch.where(is_arity3, consec_arity3 + 1, torch.zeros_like(consec_arity3))
 
             seqs = torch.stack(tokens_list, dim=1)
 
@@ -252,8 +350,8 @@ class AlphaEngine:
             adv = (rewards - rewards.mean()) / (rewards.std() + 1e-5)
             adv = torch.nan_to_num(adv, nan=0.0)
 
-            # Entropy coefficient decays linearly: 0.05 → 0.01
-            entropy_coef = max(0.02, 0.08 * (1.0 - step / ModelConfig.TRAIN_STEPS))
+            # Entropy coefficient decays linearly: 0.10 → 0.03 (higher floor for exploration)
+            entropy_coef = max(0.03, 0.10 * (1.0 - step / ModelConfig.TRAIN_STEPS))
 
             policy_loss = 0
             entropy_bonus = 0
@@ -288,20 +386,20 @@ class AlphaEngine:
                 best_idx = rewards.argmax().item()
                 candidate = seqs[best_idx].tolist()
 
-                # Validate on TEST data before accepting
+                # Validate on TEST data before accepting (always full tx costs)
                 test_res = self.vm.execute(candidate, self.loader.test_feat)
                 if test_res is not None and test_res.std() > 1e-4:
                     formula_len = self._effective_formula_length(candidate)
                     base_factors_test = self._get_base_factors(self.loader.test_feat)
-                    test_score, test_ret, test_diag = self.bt.evaluate(
+                    test_score, test_ret, test_diag = self.bt_oos.evaluate(
                         test_res, self.loader.test_raw, self.loader.test_ret,
                         formula_length=formula_len,
                         base_factors=base_factors_test,
                         return_diagnostics=True,
                     )
 
-                    # Only accept if OOS score is also positive
-                    if test_score.item() > -5.0:
+                    # Accept if OOS score is reasonable (not catastrophic)
+                    if test_score.item() > -1.0:
                         self.best_score = best_in_batch
                         self.best_formula = candidate
                         self.best_diagnostics = test_diag
@@ -357,7 +455,7 @@ class AlphaEngine:
         self._save_results()
 
     def _evaluate_oos(self, step, pbar):
-        """Run OOS evaluation on the current best formula."""
+        """Run OOS evaluation on the current best formula (always full tx costs)."""
         test_res = self.vm.execute(self.best_formula, self.loader.test_feat)
         if test_res is None or test_res.std() < 1e-4:
             return
@@ -365,7 +463,7 @@ class AlphaEngine:
         formula_len = self._effective_formula_length(self.best_formula)
         base_factors_test = self._get_base_factors(self.loader.test_feat)
 
-        test_score, test_ret, diag = self.bt.evaluate(
+        test_score, test_ret, diag = self.bt_oos.evaluate(
             test_res, self.loader.test_raw, self.loader.test_ret,
             formula_length=formula_len,
             base_factors=base_factors_test,
@@ -382,11 +480,11 @@ class AlphaEngine:
             'test_avg_turnover': diag['avg_turnover'],
         }
 
-        # Also get train diagnostics
+        # Also get train diagnostics (full tx costs)
         train_res = self.vm.execute(self.best_formula, self.loader.train_feat)
         if train_res is not None:
             base_factors_train = self._get_base_factors(self.loader.train_feat)
-            _, _, train_diag = self.bt.evaluate(
+            _, _, train_diag = self.bt_oos.evaluate(
                 train_res, self.loader.train_raw, self.loader.train_ret,
                 formula_length=formula_len,
                 base_factors=base_factors_train,
@@ -458,14 +556,13 @@ class AlphaEngine:
             print("Formula failed on full dataset.")
             return
 
-        # Compute daily PnL (replicating backtest logic)
+        # Compute daily PnL using bt_oos (always full tx costs)
         liquidity = self.loader.raw_data_cache['liquidity']
-        signal = torch.sigmoid(full_res)
-        is_safe = (liquidity > self.bt.min_liq).float()
-        position = torch.clamp(signal - 0.5, 0.0, 0.5) * 2.0 * is_safe
+        is_safe = (liquidity > self.bt_oos.min_liq).float()
+        position = self.bt_oos.compute_position(full_res, is_safe)
 
-        impact = torch.clamp(self.bt.trade_size / (liquidity + 1e-9), 0.0, 0.05)
-        total_slip = self.bt.base_fee + impact
+        impact = torch.clamp(self.bt_oos.trade_size / (liquidity + 1e-9), 0.0, 0.05)
+        total_slip = self.bt_oos.base_fee + impact
 
         prev_pos = torch.cat([torch.zeros_like(position[:, :1]), position[:, :-1]], dim=1)
         turnover = torch.abs(position - prev_pos)
@@ -487,9 +584,9 @@ class AlphaEngine:
         })
         pnl_df['year'] = pnl_df['date'].dt.year
 
-        annualization = math.sqrt(252)
+        annualization = self.bt_oos.annualization
 
-        print(f"{'Year':<6} {'Period':<7} {'Days':>5} {'Sharpe':>8} {'CumRet':>10} "
+        print(f"{'Year':<6} {'Period':<7} {'Bars':>5} {'Sharpe':>8} {'CumRet':>10} "
               f"{'MaxDD':>10} {'Turnover':>10} {'WinRate':>8}")
         print(f"{'-'*72}")
 
@@ -544,10 +641,25 @@ class AlphaEngine:
               f"{full_cum[-1]:>10.4f} {full_dd:>10.4f} {'':>10} {full_wr:>7.1%}")
         print(f"{'='*72}")
 
+        # Cross-check: bt_oos.evaluate on OOS data (per-stock median Sharpe)
+        oos_res = self.vm.execute(self.best_formula, self.loader.test_feat)
+        if oos_res is not None and oos_res.std() > 1e-4:
+            formula_len = self._effective_formula_length(self.best_formula)
+            base_test = self._get_base_factors(self.loader.test_feat)
+            _, _, oos_diag = self.bt_oos.evaluate(
+                oos_res, self.loader.test_raw, self.loader.test_ret,
+                formula_length=formula_len, base_factors=base_test,
+                return_diagnostics=True,
+            )
+            print(f"\n  bt_oos.evaluate OOS Sharpe (portfolio): {oos_diag['sharpe']:.4f}")
+            if len(test_pnl) > 0:
+                print(f"  Portfolio OOS Sharpe (mean-across-stocks):     {test_sharpe:.4f}")
+
         # Decode formula tokens
         vocab = self.model.vocab
         decoded = [vocab[t] if t < len(vocab) else f"?{t}" for t in self.best_formula]
-        print(f"\nBest Formula (decoded): {' → '.join(decoded)}")
+        decoded_str = " \u2192 ".join(decoded)
+        print(f"\nBest Formula (decoded): {decoded_str}")
         print(f"Best Formula (tokens):  {self.best_formula}")
 
         # Save cycle analysis
@@ -585,13 +697,17 @@ class AlphaEngine:
         seed_results = []
         group_name = f"ensemble-{num_seeds}seeds" if use_wandb else None
 
+        # Pre-load data once for the ensemble to share
+        _cls = loader_cls if loader_cls is not None else _default_loader_cls()
+        shared_loader = _cls()
+        shared_loader.load_data()
+
         for seed_idx in range(num_seeds):
             seed = seed_idx * 42 + 7  # deterministic but varied seeds
             print(f"\n{'='*60}")
             print(f"  ENSEMBLE: Training seed {seed_idx+1}/{num_seeds} (seed={seed})")
             print(f"{'='*60}")
 
-            _loader = loader_cls() if loader_cls is not None else None
             engine = AlphaEngine(
                 use_lord_regularization=use_lord_regularization,
                 lord_decay_rate=lord_decay_rate,
@@ -600,8 +716,14 @@ class AlphaEngine:
                 use_wandb=use_wandb,
                 wandb_project=wandb_project,
                 wandb_group=group_name,
-                loader=_loader,
+                loader=shared_loader,
             )
+
+            # Inject previously found formulas as "seen skeletons" to encourage diversity
+            for prev_formula in formulas:
+                sk = engine._formula_skeleton(prev_formula)
+                engine._seen_skeletons.add(sk)
+
             engine.train()
 
             if engine.best_formula is not None:
@@ -630,10 +752,8 @@ class AlphaEngine:
 
         ensemble = FormulaEnsemble(formulas, mode='mean')
 
-        # Evaluate ensemble on test data (reload since engines were freed)
-        _cls = loader_cls if loader_cls is not None else CryptoDataLoader
-        loader = _cls()
-        loader.load_data()
+        # Evaluate ensemble on test data (reuse shared loader)
+        loader = shared_loader
         bt = MemeBacktest()
         vm = StackVM()
 
@@ -718,7 +838,7 @@ class AlphaEngine:
             dict with CV results
         """
         # Load data
-        _cls = loader_cls if loader_cls is not None else CryptoDataLoader
+        _cls = loader_cls if loader_cls is not None else _default_loader_cls()
         loader = _cls()
         loader.load_data()
 
@@ -829,7 +949,8 @@ class AlphaEngine:
             split_idx = int(total_steps * 0.7)
             test_feat = loader.feat_tensor[:, :, split_idx:]
             test_ret = loader.target_ret[:, split_idx:]
-            test_raw = {k: v[:, split_idx:] for k, v in loader.raw_data_cache.items()}
+            test_raw = {k: (v[:, split_idx:] if v.dim() > 1 else v[split_idx:])
+                        for k, v in loader.raw_data_cache.items()}
 
             for formula_tokens, label, cv_res in zip(formulas_to_eval, labels, all_results):
                 res = vm.execute(formula_tokens, test_feat)
@@ -870,6 +991,112 @@ class AlphaEngine:
         return all_results
 
 
+    @staticmethod
+    def evaluate_online(ensemble_path="best_ensemble.json",
+                        lookback_window=20, learning_rate=0.3,
+                        decay=0.95, min_weight=0.05,
+                        period_length=1, warmup_periods=20,
+                        loader_cls=None):
+        """
+        Evaluate an ensemble with online learning (adaptive weight optimization).
+
+        Walks forward through time, updating formula weights based on
+        recent realized performance — analogous to Jane Street's daily
+        model weight updates.
+
+        Args:
+            ensemble_path: path to ensemble JSON file
+            lookback_window: rolling window for performance evaluation
+            learning_rate: weight adaptation rate (0=static, 1=fully adaptive)
+            decay: exponential decay for historical performance
+            min_weight: minimum weight per formula
+            period_length: steps per update period (1 = daily)
+            warmup_periods: periods before adaptation starts
+            loader_cls: optional data loader class
+
+        Returns:
+            dict with online learning results
+        """
+        # Load ensemble
+        with open(ensemble_path) as f:
+            ens_data = json.load(f)
+        ensemble = FormulaEnsemble.from_dict(ens_data['ensemble'])
+
+        # Load data
+        _cls = loader_cls if loader_cls is not None else _default_loader_cls()
+        loader = _cls()
+        loader.load_data()
+
+        # Use test data for online learning evaluation
+        raw_test = {k: v[:, int(v.shape[1] * loader.train_ratio):]
+                    for k, v in loader.raw_data_cache.items()}
+        test_feat = loader.test_feat
+        test_ret = loader.test_ret
+
+        # Create OnlineLearner
+        ol = OnlineLearner(
+            ensemble,
+            lookback_window=lookback_window,
+            learning_rate=learning_rate,
+            decay=decay,
+            min_weight=min_weight,
+        )
+
+        print(f"\n{'='*72}")
+        print(f"{'ONLINE LEARNING EVALUATION':^72}")
+        print(f"{'='*72}")
+        print(f"  Ensemble: {ensemble.num_formulas} formulas")
+        print(f"  Lookback: {lookback_window} periods | LR: {learning_rate} | Decay: {decay}")
+        print(f"  Period: {period_length} steps | Warmup: {warmup_periods} periods")
+        print()
+
+        # Run online simulation
+        result = ol.run_online(
+            test_feat, raw_test, test_ret,
+            period_length=period_length,
+            warmup_periods=warmup_periods,
+        )
+
+        # Print results
+        print(f"  {'Metric':<25} {'Static':>10} {'Online':>10} {'Improvement':>12}")
+        print(f"  {'-'*60}")
+        print(f"  {'Annualized Sharpe':<25} {result['static_sharpe']:>10.4f} "
+              f"{result['online_sharpe']:>10.4f} {result['improvement']:>+12.4f}")
+
+        # Cumulative PnL
+        static_cum = sum(result['static_pnl'])
+        online_cum = sum(result['online_pnl'])
+        print(f"  {'Cumulative PnL':<25} {static_cum:>10.6f} "
+              f"{online_cum:>10.6f} {online_cum - static_cum:>+12.6f}")
+
+        # Final weights
+        final_w = result['weight_history'][-1] if result['weight_history'] else []
+        print(f"\n  Final Adaptive Weights: {[f'{w:.3f}' for w in final_w]}")
+        print(f"{'='*72}")
+
+        # Save results
+        save_data = {
+            'online_sharpe': result['online_sharpe'],
+            'static_sharpe': result['static_sharpe'],
+            'improvement': result['improvement'],
+            'final_weights': final_w.tolist() if hasattr(final_w, 'tolist') else list(final_w),
+            'config': {
+                'lookback_window': lookback_window,
+                'learning_rate': learning_rate,
+                'decay': decay,
+                'min_weight': min_weight,
+                'period_length': period_length,
+                'warmup_periods': warmup_periods,
+            },
+            'online_learner': ol.to_dict(),
+        }
+        with open("online_learning_results.json", "w") as f:
+            json.dump(save_data, f, indent=2)
+        print(f"\n  Results saved to online_learning_results.json")
+
+        return result
+
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == 'ensemble':
@@ -882,6 +1109,10 @@ if __name__ == "__main__":
     elif len(sys.argv) > 1 and sys.argv[1] == 'cv-single':
         # python -m model_core.engine cv-single
         AlphaEngine.evaluate_with_cv()
+    elif len(sys.argv) > 1 and sys.argv[1] == 'online':
+        # python -m model_core.engine online [ensemble_path]
+        ens_path = sys.argv[2] if len(sys.argv) > 2 else "best_ensemble.json"
+        AlphaEngine.evaluate_online(ensemble_path=ens_path)
     else:
         eng = AlphaEngine(use_lord_regularization=True)
         eng.train()

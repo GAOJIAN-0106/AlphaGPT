@@ -163,7 +163,7 @@ class FeatureEngineer:
     INPUT_DIM = 12
 
     @staticmethod
-    def compute_features(raw_dict):
+    def compute_features(raw_dict, bars_per_day=1):
         c = raw_dict['close']
         o = raw_dict['open']
         h = raw_dict['high']
@@ -171,6 +171,10 @@ class FeatureEngineer:
         v = raw_dict['volume']
         liq = raw_dict['liquidity']
         fdv = raw_dict['fdv']
+
+        # Scale rolling windows by bars_per_day so that window covers
+        # the same calendar duration regardless of bar frequency.
+        bpd = max(1, bars_per_day)
 
         def robust_norm(t):
             median = torch.nanmedian(t, dim=1, keepdim=True)[0]
@@ -182,14 +186,14 @@ class FeatureEngineer:
         ret = torch.log(c / (torch.cat([torch.zeros_like(c[:, :1]), c[:, :-1]], dim=1) + 1e-9))
         liq_score = MemeIndicators.liquidity_health(liq, fdv)
         pressure = MemeIndicators.buy_sell_imbalance(c, o, h, l)
-        fomo = MemeIndicators.fomo_acceleration(v)
-        dev = MemeIndicators.pump_deviation(c)
+        fomo = MemeIndicators.fomo_acceleration(v, window=5 * bpd)
+        dev = MemeIndicators.pump_deviation(c, window=20 * bpd)
         log_vol = torch.log1p(v)
 
         # Advanced factors (6-11)
-        vol_cluster = MemeIndicators.volatility_clustering(c)
-        momentum_rev = MemeIndicators.momentum_reversal(c)
-        rel_strength = MemeIndicators.relative_strength(c, h, l)
+        vol_cluster = MemeIndicators.volatility_clustering(c, window=10 * bpd)
+        momentum_rev = MemeIndicators.momentum_reversal(c, window=5 * bpd)
+        rel_strength = MemeIndicators.relative_strength(c, h, l, window=14 * bpd)
         hl_range = (h - l) / (c + 1e-9)
         close_pos = (c - l) / (h - l + 1e-9)
         vol_prev = torch.cat([torch.zeros_like(v[:, :1]), v[:, :-1]], dim=1)

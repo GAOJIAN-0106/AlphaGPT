@@ -1,12 +1,12 @@
 import torch
-from .ops import OPS_CONFIG
-from .factors import FeatureEngineer
+from .config import ModelConfig
 
 class StackVM:
-    def __init__(self):
-        self.feat_offset = FeatureEngineer.INPUT_DIM
-        self.op_map = {i + self.feat_offset: cfg[1] for i, cfg in enumerate(OPS_CONFIG)}
-        self.arity_map = {i + self.feat_offset: cfg[2] for i, cfg in enumerate(OPS_CONFIG)}
+    def __init__(self, feat_offset=None, ops_config=None):
+        self.feat_offset = feat_offset if feat_offset is not None else ModelConfig.get_feature_dim()
+        _ops = ops_config if ops_config is not None else ModelConfig.get_ops_config()
+        self.op_map = {i + self.feat_offset: cfg[1] for i, cfg in enumerate(_ops)}
+        self.arity_map = {i + self.feat_offset: cfg[2] for i, cfg in enumerate(_ops)}
 
     def execute(self, formula_tokens, feat_tensor):
         stack = []

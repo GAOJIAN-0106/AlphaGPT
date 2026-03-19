@@ -125,7 +125,8 @@ def evaluate_formula_cv(formula, feat_tensor, target_ret, raw_data, cv):
         # Slice data for this fold's test window
         test_feat = feat_tensor[:, :, vs:ve]
         test_ret = target_ret[:, vs:ve]
-        test_raw = {k: v[:, vs:ve] for k, v in raw_data.items()}
+        test_raw = {k: (v[:, vs:ve] if v.dim() > 1 else v[vs:ve])
+                    for k, v in raw_data.items()}
 
         # Execute formula on test fold
         res = vm.execute(formula, test_feat)

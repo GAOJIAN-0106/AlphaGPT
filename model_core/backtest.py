@@ -2,27 +2,125 @@ import torch
 import math
 import numpy as np
 
+from .config import ModelConfig, TimeframeProfile
+
 
 class MemeBacktest:
-    def __init__(self):
-        self.trade_size = 100000.0   # A股：10万元
-        self.min_liq = 10000000.0    # A股：成交额>1000万
-        self.base_fee = 0.0015       # A股：印花税0.05%+佣金0.025%*2 ≈ 0.15%
-        self.annualization = math.sqrt(252)
+    def __init__(self, position_mode='sigmoid_clamp', target_turnover=None,
+                 timeframe=None, asset_class=None, rebalance_freq=None):
+        profile = TimeframeProfile(
+            timeframe or ModelConfig.TIMEFRAME,
+            asset_class or ModelConfig.ASSET_CLASS,
+        )
+        self.trade_size = profile.trade_size
+        self.min_liq = profile.min_liq
+        self.base_fee = profile.base_fee
+        self.position_mode = position_mode
+        self.tx_cost_scale = 1.0
+
+        # If rebalancing less frequently than bar frequency (Plan B),
+        # use rebalance frequency for annualization and turnover targets.
+        # rebalance_freq: 'daily' means rebalance once per day regardless of bar freq.
+        if rebalance_freq == 'daily' or (rebalance_freq is None and profile.bars_per_day > 1):
+            # Annualize based on daily rebalance, not bar frequency
+            self.annualization = math.sqrt(252)
+            self.target_turnover = target_turnover if target_turnover is not None else 0.05
+            self.lazy_threshold = 0.01
+        else:
+            self.annualization = profile.annualization
+            self.target_turnover = target_turnover if target_turnover is not None else profile.target_turnover
+            self.lazy_threshold = profile.lazy_threshold
+
+    # ------------------------------------------------------------------
+    # Position sizing methods
+    # ------------------------------------------------------------------
+
+    def compute_position(self, factors, is_safe):
+        """Compute position based on position_mode.
+
+        Args:
+            factors: [N, T] factor values
+            is_safe: [N, T] liquidity safety mask (0 or 1)
+
+        Returns:
+            position: [N, T] in [0, 1]
+        """
+        if self.position_mode == 'rank':
+            return self._compute_position_rank(factors, is_safe)
+        elif self.position_mode == 'zscore':
+            return self._compute_position_zscore(factors, is_safe)
+        elif self.position_mode == 'quantile':
+            return self._compute_position_quantile(factors, is_safe)
+        else:  # sigmoid_clamp (original)
+            signal = torch.sigmoid(factors)
+            return torch.clamp(signal - 0.5, 0.0, 0.5) * 2.0 * is_safe
+
+    def _compute_position_rank(self, factors, is_safe):
+        """Cross-sectional rank: top 40% get position, rest zero."""
+        N = factors.shape[0]
+        if N < 2:
+            signal = torch.sigmoid(factors)
+            return torch.clamp(signal - 0.5, 0.0, 0.5) * 2.0 * is_safe
+        ranks = factors.argsort(dim=0).argsort(dim=0).float()
+        rank_pct = ranks / (N - 1)
+        # Top 40% gets position linearly from 0 to 1
+        position = torch.clamp((rank_pct - 0.6) / 0.4, 0.0, 1.0) * is_safe
+        return position
+
+    def _compute_position_zscore(self, factors, is_safe):
+        """Cross-sectional z-score → steeper sigmoid."""
+        N = factors.shape[0]
+        if N < 2:
+            signal = torch.sigmoid(factors)
+            return torch.clamp(signal - 0.5, 0.0, 0.5) * 2.0 * is_safe
+        mean = factors.mean(dim=0, keepdim=True)
+        std = factors.std(dim=0, keepdim=True) + 1e-6
+        z = (factors - mean) / std
+        # Steeper sigmoid for more decisive positions
+        signal = torch.sigmoid(z * 1.5)
+        position = torch.clamp(signal - 0.5, 0.0, 0.5) * 2.0 * is_safe
+        return position
+
+    def _compute_position_quantile(self, factors, is_safe):
+        """Discrete quantile buckets: top 10% = 1.0, 10-25% = 0.5, rest = 0."""
+        N = factors.shape[0]
+        if N < 5:
+            signal = torch.sigmoid(factors)
+            return torch.clamp(signal - 0.5, 0.0, 0.5) * 2.0 * is_safe
+        ranks = factors.argsort(dim=0).argsort(dim=0).float()
+        rank_pct = ranks / (N - 1)
+        position = torch.zeros_like(factors)
+        position = torch.where(rank_pct >= 0.90, torch.ones_like(factors), position)
+        position = torch.where(
+            (rank_pct >= 0.75) & (rank_pct < 0.90),
+            torch.full_like(factors, 0.5),
+            position,
+        )
+        return position * is_safe
+
+    # ------------------------------------------------------------------
+    # Main evaluation
+    # ------------------------------------------------------------------
 
     def evaluate(self, factors, raw_data, target_ret,
                  formula_length=None, base_factors=None,
                  return_diagnostics=False, **kwargs):
         """Evaluate a factor signal via simulated backtest.
 
+        Computes portfolio-level Sharpe and MaxDD (aggregate across stocks
+        first, then compute metrics on the portfolio PnL series), matching
+        the standard industry practice for multi-asset strategies.
+
+        Per-stock metrics (turnover, lazy penalty) are computed per-stock
+        then aggregated, since they relate to individual trading activity.
+
         Args:
-            factors: Tensor of factor values [batch, time_steps] or [batch, time_steps, stocks].
+            factors: [N, T] factor values (N stocks, T time steps).
             raw_data: Dict with 'liquidity' tensor.
-            target_ret: Forward return tensor matching factors shape.
-            formula_length: Optional int, number of tokens in the formula.
-                            Applies complexity penalty when > 6.
-            base_factors: Optional tensor of existing factors for redundancy check.
-            return_diagnostics: If True, return (score, mean_ret, diagnostics_dict).
+            target_ret: [N, T] forward return tensor.
+            formula_length: Optional int for complexity penalty.
+            base_factors: Optional tensor for redundancy check.
+            return_diagnostics: If True, return (score, mean_ret, diagnostics).
 
         Returns:
             (final_fitness, mean_ret) by default.
@@ -35,15 +133,38 @@ class MemeBacktest:
         factors = torch.nan_to_num(factors, nan=0.0)
         target_ret = torch.nan_to_num(target_ret, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # --- Continuous position sizing ---
-        signal = torch.sigmoid(factors)
+        # --- Position sizing (dispatched by mode) ---
         is_safe = (liquidity > self.min_liq).float()
-        position = torch.clamp(signal - 0.5, 0.0, 0.5) * 2.0 * is_safe
+        target_position = self.compute_position(factors, is_safe)
+
+        # --- Daily rebalance: only update position at rebalance points ---
+        rebal_mask = raw_data.get('rebalance_mask')
+        if rebal_mask is not None and rebal_mask.sum() < rebal_mask.numel():
+            # Vectorized: forward-fill position from rebalance points.
+            # At rebalance bars, use target_position; otherwise carry forward.
+            # Build segment IDs via cumsum of rebalance_mask, then scatter.
+            rm = rebal_mask.unsqueeze(0)  # [1, T]
+            # Multiply target by mask, then forward-fill zeros
+            position = target_position * rm  # only rebalance bars have values
+            # Forward fill: replace 0s between rebalance points
+            # Use segment-based approach: cumsum of mask gives segment ids
+            seg_ids = rebal_mask.cumsum(0).long()  # [T]
+            # For each segment, all bars should have the value at segment start
+            # Gather the rebalance-point values using segment ids
+            rebal_indices = torch.where(rebal_mask > 0.5)[0]  # indices of rebalance bars
+            if len(rebal_indices) > 0:
+                # Pad segment 0 (before first rebalance) to use first rebalance value
+                seg_ids_clamped = torch.clamp(seg_ids - 1, min=0)  # 0-based segment index
+                seg_ids_clamped = torch.clamp(seg_ids_clamped, max=len(rebal_indices) - 1)
+                # Gather: position at each bar = target_position at its segment's rebalance bar
+                position = target_position[:, rebal_indices[seg_ids_clamped]]  # [N, T]
+        else:
+            position = target_position
 
         # --- Transaction costs ---
         impact_slippage = self.trade_size / (liquidity + 1e-9)
         impact_slippage = torch.clamp(impact_slippage, 0.0, 0.05)
-        total_slippage_one_way = self.base_fee + impact_slippage
+        total_slippage_one_way = (self.base_fee + impact_slippage) * self.tx_cost_scale
 
         prev_pos = torch.roll(position, 1, dims=1)
         prev_pos[:, 0] = 0
@@ -52,65 +173,76 @@ class MemeBacktest:
 
         # --- PnL ---
         gross_pnl = position * target_ret
-        net_pnl = gross_pnl - tx_cost
+        net_pnl = gross_pnl - tx_cost                             # [N, T]
 
-        # --- Sharpe Ratio (annualized, per-sample in batch) ---
-        daily_mean = net_pnl.mean(dim=1)
-        daily_std = net_pnl.std(dim=1)
-        sharpe = (daily_mean / (daily_std + 1e-8)) * self.annualization
-        sharpe = torch.nan_to_num(sharpe, nan=0.0)
+        # --- Portfolio PnL (equal-weight across stocks) ---
+        portfolio_pnl = net_pnl.mean(dim=0)                       # [T]
 
-        # --- Rolling max drawdown ---
-        cum_pnl = net_pnl.cumsum(dim=1)                     # [batch, T]
-        running_max = cum_pnl.cummax(dim=1).values           # [batch, T]
-        drawdown = running_max - cum_pnl                     # [batch, T]
-        max_drawdown = drawdown.max(dim=1).values            # [batch]
+        # --- Portfolio Sharpe (annualized) ---
+        port_mean = portfolio_pnl.mean()
+        port_std = portfolio_pnl.std() + 1e-8
+        portfolio_sharpe = (port_mean / port_std) * self.annualization
+        portfolio_sharpe = torch.nan_to_num(portfolio_sharpe, nan=0.0)
 
-        # --- Activity threshold ---
-        time_steps = position.shape[1]
-        min_trades = max(20, int(0.1 * time_steps))
-        activity = (position > 0.05).float().sum(dim=1)
+        # --- Portfolio MaxDD ---
+        cum_pnl = portfolio_pnl.cumsum(dim=0)                     # [T]
+        running_max = cum_pnl.cummax(dim=0).values                 # [T]
+        portfolio_maxdd = (running_max - cum_pnl).max()            # scalar
 
-        # --- Base score from Sharpe minus drawdown penalty ---
-        # Drawdown penalty: proportional, scaled so a 20% drawdown costs ~2 points
-        drawdown_penalty = max_drawdown * 2.0
-        score = sharpe - drawdown_penalty
+        # --- Score: portfolio Sharpe minus portfolio drawdown penalty ---
+        drawdown_penalty = portfolio_maxdd * 2.0
+        score = portfolio_sharpe - drawdown_penalty
 
         # --- Complexity penalty ---
         if formula_length is not None:
             complexity_penalty = 0.1 * max(0, formula_length - 6)
             score = score - complexity_penalty
 
-        # --- Factor redundancy penalty ---
+        # --- Factor redundancy penalty (per-stock, then mean) ---
         if base_factors is not None:
             redundancy_penalty = self._redundancy_penalty(factors, base_factors)
-            score = score - redundancy_penalty
+            score = score - redundancy_penalty.mean()
 
-        # --- Turnover floor penalty ---
-        avg_turnover_per_sample = turnover.mean(dim=1)
+        # --- Per-stock turnover penalties (keep per-stock, aggregate to scalar) ---
+        # When using rebalance mask, compute daily turnover by dividing total
+        # turnover by number of rebalance points (not total bars).
+        rebal_mask = raw_data.get('rebalance_mask')
+        if rebal_mask is not None and rebal_mask.sum() < rebal_mask.numel():
+            n_rebal = max(1, int(rebal_mask.sum().item()))
+            avg_turnover_per_stock = turnover.sum(dim=1) / n_rebal  # [N]
+        else:
+            avg_turnover_per_stock = turnover.mean(dim=1)              # [N]
+        target_to = self.target_turnover
         lazy_penalty = torch.where(
-            avg_turnover_per_sample < 0.005,
-            torch.tensor(1.0, device=device),
-            torch.tensor(0.0, device=device),
+            avg_turnover_per_stock < self.lazy_threshold,
+            torch.tensor(3.0, device=device),
+            torch.where(
+                avg_turnover_per_stock < target_to,
+                (target_to - avg_turnover_per_stock) / target_to * 2.0,
+                torch.tensor(0.0, device=device),
+            ),
         )
-        score = score - lazy_penalty
+        score = score - lazy_penalty.mean()
 
-        # --- Inactive penalty ---
-        score = torch.where(
-            activity < min_trades,
-            torch.tensor(-10.0, device=device),
-            score,
-        )
+        # --- Turnover bonus (per-stock, capped, then mean) ---
+        turnover_bonus = torch.clamp(avg_turnover_per_stock * 5.0, 0.0, 0.5)
+        score = score + turnover_bonus.mean()
 
-        # --- Final aggregation ---
+        # --- Portfolio-level activity check ---
+        # active_ratio: average fraction of stocks with position at each time step
+        active_ratio = (position > 0.05).float().mean()            # scalar
+        if active_ratio.item() < 0.05:
+            score = torch.tensor(-10.0, device=device)
+
+        # --- Final score with IC ---
         score = torch.nan_to_num(score, nan=-10.0)
-        per_stock_score = torch.median(score)
         ic = self._cross_sectional_ic(factors, target_ret)
-        final_fitness = per_stock_score + ic * 10.0
+        ic_clipped = max(-0.3, min(0.3, ic))
+        final_fitness = score + ic_clipped * 2.0
 
-        cum_ret = net_pnl.sum(dim=1)
-        mean_ret = cum_ret.mean().item()
-        mean_ret = 0.0 if (mean_ret != mean_ret) else mean_ret  # NaN guard
+        # --- Portfolio cumulative return ---
+        mean_ret = portfolio_pnl.sum().item()
+        mean_ret = 0.0 if (mean_ret != mean_ret) else mean_ret
 
         if return_diagnostics:
             # Factor autocorrelation: corr(factor_t, factor_{t-1})
@@ -127,9 +259,9 @@ class MemeBacktest:
             factor_autocorr = (numerator / denominator).mean().item()
 
             diagnostics = {
-                'sharpe': sharpe.median().item(),
-                'max_drawdown': max_drawdown.median().item(),
-                'avg_turnover': turnover.mean().item(),
+                'sharpe': portfolio_sharpe.item(),
+                'max_drawdown': portfolio_maxdd.item(),
+                'avg_turnover': avg_turnover_per_stock.mean().item(),
                 'factor_autocorrelation': factor_autocorr,
                 'ic': ic,
             }
@@ -213,7 +345,19 @@ class MemeBacktest:
         num = (f_dm * r_dm).sum(dim=0)
         den = torch.sqrt((f_dm**2).sum(dim=0)) * torch.sqrt((r_dm**2).sum(dim=0)) + 1e-8
         ic = torch.nan_to_num(num / den, nan=0.0)
-        return ic.mean().item()
+        raw_ic = ic.mean().item()
+
+        # Discount IC for binary/degenerate factors:
+        # Count unique values per stock (dim=1), average across stocks
+        # A truly binary factor has ~2 unique values per row
+        unique_counts = []
+        for i in range(min(N, 10)):  # sample up to 10 stocks for speed
+            unique_counts.append(factors[i].unique().numel())
+        avg_unique = sum(unique_counts) / len(unique_counts) if unique_counts else 100
+        if avg_unique < 5:
+            # Binary/near-binary factor: discount IC by 70%
+            raw_ic *= 0.3
+        return raw_ic
 
     @staticmethod
     def _redundancy_penalty(factors, base_factors):

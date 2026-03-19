@@ -1,13 +1,14 @@
 import pandas as pd
 import torch
 import sqlalchemy
-from .config import ModelConfig
+from .config import ModelConfig, TimeframeProfile
 from .factors import FeatureEngineer
 
 class CryptoDataLoader:
-    def __init__(self, train_ratio=0.7):
+    def __init__(self, train_ratio=0.7, timeframe: str = None):
         self.engine = sqlalchemy.create_engine(ModelConfig.DB_URL)
         self.train_ratio = train_ratio
+        self.timeframe = timeframe or ModelConfig.TIMEFRAME
         self.feat_tensor = None
         self.raw_data_cache = None
         self.target_ret = None
@@ -25,6 +26,7 @@ class CryptoDataLoader:
         SELECT time, address, open, high, low, close, volume, liquidity, fdv
         FROM ohlcv
         WHERE address IN ({addr_str})
+          AND timeframe = '{self.timeframe}'
         ORDER BY time ASC
         """
         df = pd.read_sql(data_query, self.engine)
@@ -52,8 +54,9 @@ class CryptoDataLoader:
         self.target_ret = (next_close - close) / (close + 1e-9)
         self.target_ret[:, -1] = 0.0  # 最后一天无收益
 
-        # 清理异常值
-        self.target_ret = torch.clamp(self.target_ret, -0.2, 0.2)  # 限制在±20%
+        # 清理异常值（clamp 随周期自动缩放：日线±20%，15min±5%，5min±2.9%…）
+        profile = TimeframeProfile(self.timeframe, ModelConfig.ASSET_CLASS)
+        self.target_ret = torch.clamp(self.target_ret, -profile.ret_clamp, profile.ret_clamp)
         self.target_ret = torch.nan_to_num(self.target_ret, nan=0.0)
 
         print(f"Data Ready. Shape: {self.feat_tensor.shape}")

@@ -2,8 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .config import ModelConfig
-from .ops import OPS_CONFIG
-from .factors import FeatureEngineer
+from .features_v2 import FEATURES_V1_LIST, FEATURES_V2_LIST, FEATURES_V3_LIST
 
 
 class NewtonSchulzLowRankDecay:
@@ -223,23 +222,31 @@ class AlphaGPT(nn.Module):
     def __init__(self):
         super().__init__()
         self.d_model = 64
-        self.features_list = [
-            'RET', 'LIQ', 'PRESSURE', 'FOMO', 'DEV', 'LOG_VOL',
-            'VOL_CLUSTER', 'MOM_REV', 'REL_STR', 'HL_RANGE', 'CLOSE_POS', 'VOL_TREND',
-        ]
-        self.ops_list = [cfg[0] for cfg in OPS_CONFIG]
 
-        assert len(self.features_list) == FeatureEngineer.INPUT_DIM, (
+        # Config-driven vocab: futures gets 18 features + 20 ops, others get 12 + 12
+        ops_config = ModelConfig.get_ops_config()
+        feat_dim = ModelConfig.get_feature_dim()
+        max_len = ModelConfig.get_max_formula_len()
+
+        if feat_dim >= 21:
+            self.features_list = FEATURES_V3_LIST
+        elif feat_dim == 18:
+            self.features_list = FEATURES_V2_LIST
+        else:
+            self.features_list = FEATURES_V1_LIST
+        self.ops_list = [cfg[0] for cfg in ops_config]
+
+        assert len(self.features_list) == feat_dim, (
             f"AlphaGPT features_list has {len(self.features_list)} items "
-            f"but FeatureEngineer.INPUT_DIM = {FeatureEngineer.INPUT_DIM}"
+            f"but get_feature_dim() = {feat_dim}"
         )
 
         self.vocab = self.features_list + self.ops_list
         self.vocab_size = len(self.vocab)
-        
+
         # Embedding
         self.token_emb = nn.Embedding(self.vocab_size, self.d_model)
-        self.pos_emb = nn.Parameter(torch.zeros(1, ModelConfig.MAX_FORMULA_LEN + 1, self.d_model))
+        self.pos_emb = nn.Parameter(torch.zeros(1, max_len + 1, self.d_model))
         
         # Enhanced Transformer with Looped Transformer
         self.blocks = LoopedTransformer(
