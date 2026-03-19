@@ -336,14 +336,15 @@ class TestEngineTrackerIntegration:
             mock_loader = MagicMock()
             MockLoader.return_value = mock_loader
 
-            with patch("model_core.engine.AlphaGPT") as MockModel:
-                mock_model = MagicMock()
-                mock_model.parameters.return_value = [torch.nn.Parameter(torch.zeros(1))]
-                MockModel.return_value.to.return_value = mock_model
+            with patch("model_core.engine.DuckDBDataLoader", MockLoader):
+                with patch("model_core.engine.AlphaGPT") as MockModel:
+                    mock_model = MagicMock()
+                    mock_model.parameters.return_value = [torch.nn.Parameter(torch.zeros(1))]
+                    MockModel.return_value.to.return_value = mock_model
 
-                from model_core.engine import AlphaEngine
-                engine = AlphaEngine(use_lord_regularization=False)
-                assert isinstance(engine.tracker, DummyTracker)
+                    from model_core.engine import AlphaEngine
+                    engine = AlphaEngine(use_lord_regularization=False)
+                    assert isinstance(engine.tracker, DummyTracker)
 
     def test_engine_creates_wandb_tracker_when_enabled(self):
         """When use_wandb=True, engine creates a WandbTracker."""
@@ -357,20 +358,21 @@ class TestEngineTrackerIntegration:
                 mock_loader = MagicMock()
                 MockLoader.return_value = mock_loader
 
-                with patch("model_core.engine.AlphaGPT") as MockModel:
-                    mock_model = MagicMock()
-                    mock_model.parameters.return_value = [torch.nn.Parameter(torch.zeros(1))]
-                    MockModel.return_value.to.return_value = mock_model
+                with patch("model_core.engine.DuckDBDataLoader", MockLoader):
+                    with patch("model_core.engine.AlphaGPT") as MockModel:
+                        mock_model = MagicMock()
+                        mock_model.parameters.return_value = [torch.nn.Parameter(torch.zeros(1))]
+                        MockModel.return_value.to.return_value = mock_model
 
-                    from model_core.engine import AlphaEngine
-                    engine = AlphaEngine(
-                        use_lord_regularization=False,
-                        use_wandb=True,
-                        wandb_project="test-alphagpt",
-                    )
+                        from model_core.engine import AlphaEngine
+                        engine = AlphaEngine(
+                            use_lord_regularization=False,
+                            use_wandb=True,
+                            wandb_project="test-alphagpt",
+                        )
 
-                    from model_core.tracking import WandbTracker
-                    assert isinstance(engine.tracker, WandbTracker)
+                        from model_core.tracking import WandbTracker
+                        assert isinstance(engine.tracker, WandbTracker)
 
     def test_engine_passes_config_to_tracker(self):
         """Engine passes relevant config dict when creating the tracker."""
@@ -384,22 +386,23 @@ class TestEngineTrackerIntegration:
                 mock_loader = MagicMock()
                 MockLoader.return_value = mock_loader
 
-                with patch("model_core.engine.AlphaGPT") as MockModel:
-                    mock_model = MagicMock()
-                    mock_model.parameters.return_value = [torch.nn.Parameter(torch.zeros(1))]
-                    mock_model.named_parameters.return_value = [("w", torch.nn.Parameter(torch.zeros(1)))]
-                    MockModel.return_value.to.return_value = mock_model
+                with patch("model_core.engine.DuckDBDataLoader", MockLoader):
+                    with patch("model_core.engine.AlphaGPT") as MockModel:
+                        mock_model = MagicMock()
+                        mock_model.parameters.return_value = [torch.nn.Parameter(torch.zeros(1))]
+                        mock_model.named_parameters.return_value = [("w", torch.nn.Parameter(torch.zeros(1)))]
+                        MockModel.return_value.to.return_value = mock_model
 
-                    with patch("model_core.engine.NewtonSchulzLowRankDecay"):
-                        with patch("model_core.engine.StableRankMonitor"):
-                            from model_core.engine import AlphaEngine
-                            engine = AlphaEngine(
-                                use_lord_regularization=True,
-                                lord_decay_rate=0.002,
-                                seed=123,
-                                use_wandb=True,
-                                wandb_project="my-project",
-                            )
+                        with patch("model_core.engine.NewtonSchulzLowRankDecay"):
+                            with patch("model_core.engine.StableRankMonitor"):
+                                from model_core.engine import AlphaEngine
+                                engine = AlphaEngine(
+                                    use_lord_regularization=True,
+                                    lord_decay_rate=0.002,
+                                    seed=123,
+                                    use_wandb=True,
+                                    wandb_project="my-project",
+                                )
 
         # Verify wandb.init was called with the right config keys
         init_call = mock_wandb.init.call_args

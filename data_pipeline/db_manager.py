@@ -37,13 +37,14 @@ class DBManager:
                     low DOUBLE PRECISION,
                     close DOUBLE PRECISION,
                     volume DOUBLE PRECISION,
-                    liquidity DOUBLE PRECISION, 
+                    liquidity DOUBLE PRECISION,
                     fdv DOUBLE PRECISION,
                     source TEXT,
-                    PRIMARY KEY (time, address)
+                    timeframe TEXT NOT NULL DEFAULT '1d',
+                    PRIMARY KEY (time, address, timeframe)
                 );
             """)
-            
+
             try:
                 await conn.execute("SELECT create_hypertable('ohlcv', 'time', if_not_exists => TRUE);")
                 logger.info("Converted ohlcv to Hypertable.")
@@ -51,6 +52,29 @@ class DBManager:
                 logger.warning("TimescaleDB extension not found, using standard Postgres.")
 
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_ohlcv_address ON ohlcv (address);")
+
+        # Migrate existing tables that lack the timeframe column
+        await self._migrate_add_timeframe()
+
+    async def _migrate_add_timeframe(self):
+        """Add timeframe column to ohlcv if it doesn't exist (migration for existing DBs)."""
+        async with self.pool.acquire() as conn:
+            has_col = await conn.fetchval("""
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'ohlcv' AND column_name = 'timeframe'
+                );
+            """)
+            if has_col:
+                return
+
+            logger.info("Migrating ohlcv: adding timeframe column...")
+            await conn.execute("ALTER TABLE ohlcv ADD COLUMN timeframe TEXT NOT NULL DEFAULT '1d';")
+
+            # Recreate PK to include timeframe
+            await conn.execute("ALTER TABLE ohlcv DROP CONSTRAINT IF EXISTS ohlcv_pkey;")
+            await conn.execute("ALTER TABLE ohlcv ADD PRIMARY KEY (time, address, timeframe);")
+            logger.info("Migration complete: ohlcv now includes timeframe in PK.")
 
     async def upsert_tokens(self, tokens):
         if not tokens: return
@@ -70,8 +94,8 @@ class DBManager:
                 await conn.copy_records_to_table(
                     'ohlcv',
                     records=records,
-                    columns=['time', 'address', 'open', 'high', 'low', 'close', 
-                             'volume', 'liquidity', 'fdv', 'source'],
+                    columns=['time', 'address', 'open', 'high', 'low', 'close',
+                             'volume', 'liquidity', 'fdv', 'source', 'timeframe'],
                     timeout=60
                 )
             except asyncpg.UniqueViolationError:

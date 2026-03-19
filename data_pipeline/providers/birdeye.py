@@ -48,7 +48,7 @@ class BirdeyeProvider(DataProvider):
                 logger.error(f"Birdeye Trending Exception: {e}")
                 return []
 
-    async def get_token_history(self, session, address, days=Config.HISTORY_DAYS):
+    async def get_token_history(self, session, address, days=Config.HISTORY_DAYS, timeframe: str = '1d'):
         time_to = int(datetime.now().timestamp())
         time_from = int((datetime.now() - timedelta(days=days)).timestamp())
         

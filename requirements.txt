@@ -43,6 +43,9 @@ plotly>=5.17.0        # Interactive charts
 # PostgreSQL
 psycopg2-binary>=2.9.10
 
+# DuckDB (local commodity futures data)
+duckdb>=1.0.0
+
 # ===== Optional Dependencies (For experimental scripts) =====
 # See requirements-optional.txt for:
 #   - matplotlib, seaborn (for lord/experiment.py visualization)

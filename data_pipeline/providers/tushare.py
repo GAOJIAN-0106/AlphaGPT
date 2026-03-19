@@ -194,7 +194,7 @@ class TushareProvider(DataProvider):
 
         return results
 
-    async def get_token_history(self, session, address: str, days: int = Config.HISTORY_DAYS):
+    async def get_token_history(self, session, address: str, days: int = Config.HISTORY_DAYS, timeframe: str = '1d'):
         """
         获取股票 OHLCV 历史数据
         返回: [(time, address, o, h, l, c, vol, liquidity, fdv, source), ...]

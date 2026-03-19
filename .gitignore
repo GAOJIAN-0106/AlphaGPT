@@ -68,3 +68,21 @@ portfolio_state.json
 
 # Claude Code
 .claude/
+
+# Trading signals and state (contains credentials/positions)
+signals/
+sim_results/
+logs/
+
+# IC screening intermediate results
+ic_screening_results.json
+ic_screening_v2.json
+feature_dim_comparison.json
+online_learning_results.json
+
+# Cached high-frequency factor data
+*.parquet
+
+# Test files
+test_dates.py
+test_planb.py

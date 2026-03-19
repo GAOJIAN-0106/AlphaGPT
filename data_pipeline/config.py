@@ -8,6 +8,8 @@ load_dotenv()
 class DataSourceMode(Enum):
     SOLANA = "solana"
     ASTOCK = "astock"
+    TIANQIN = "tianqin"
+    DUCKDB = "duckdb"
 
 
 class Config:
@@ -37,3 +39,31 @@ class Config:
     ASTOCK_POOL_TYPE = os.getenv("ASTOCK_POOL_TYPE", "hs300")  # hs300/zz500/zz1000/sz50/all
     ASTOCK_START_DATE = os.getenv("ASTOCK_START_DATE", "20200101")
     ASTOCK_MIN_MARKET_CAP = float(os.getenv("ASTOCK_MIN_MARKET_CAP", "1000000000"))  # 最小市值10亿
+
+    # 天勤量化 TianQin (tqsdk) configurations
+    TIANQIN_USER = os.getenv("TIANQIN_USER", "")
+    TIANQIN_PASSWORD = os.getenv("TIANQIN_PASSWORD", "")
+    TIANQIN_ASSET_TYPE = os.getenv("TIANQIN_ASSET_TYPE", "futures")  # futures / stock
+    TIANQIN_TIMEFRAMES = os.getenv("TIANQIN_TIMEFRAMES", "1d").split(",")  # e.g. "1d,5m,15m"
+    TIANQIN_FUTURES_EXCHANGES = os.getenv("TIANQIN_FUTURES_EXCHANGES", "SHFE,DCE,CZCE,INE,CFFEX,GFEX").split(",")
+    TIANQIN_STOCK_POOL = os.getenv("TIANQIN_STOCK_POOL", "SSE,SZSE")  # 上交所,深交所
+    TIANQIN_DATA_LENGTH = int(os.getenv("TIANQIN_DATA_LENGTH", "8000"))  # K线条数
+    TIANQIN_START_DATE = os.getenv("TIANQIN_START_DATE", "2020-01-01")
+
+    # DuckDB 本地商品期货数据源
+    DUCKDB_PATH = os.getenv("DUCKDB_PATH", os.path.expanduser("~/quant/tick_data/kline_1min.duckdb"))
+    DUCKDB_PRODUCTS = [p.strip() for p in os.getenv("DUCKDB_PRODUCTS", "").split(",") if p.strip()]
+    DUCKDB_EXCHANGES = [e.strip() for e in os.getenv("DUCKDB_EXCHANGES", "").split(",") if e.strip()]
+    DUCKDB_TIMEFRAMES = os.getenv("DUCKDB_TIMEFRAMES", "1d").split(",")
+
+
+
+# 时间周期到秒数的映射 (用于 tqsdk duration_seconds)
+TIMEFRAME_DURATION_MAP = {
+    "1m": 60,
+    "5m": 300,
+    "15m": 900,
+    "30m": 1800,
+    "1h": 3600,
+    "1d": 86400,
+}
