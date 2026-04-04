@@ -88,9 +88,9 @@ class FactorRegistry:
         self._by_freq: dict[str, list[str]] = defaultdict(list)
 
     def register(self, factor: FactorBase):
-        """Register a factor instance."""
+        """Register a factor instance. Silently skip if already registered."""
         if factor.name in self._factors:
-            raise ValueError(f"Factor '{factor.name}' already registered")
+            return
         self._factors[factor.name] = factor
         self._by_freq[factor.frequency].append(factor.name)
 
@@ -129,7 +129,21 @@ class FactorRegistry:
         if not results:
             return None, []
 
-        return torch.stack(results, dim=1), valid_names  # [N, F, T]
+        # Align all results to same N and T dimensions
+        # (different factors may have different product counts due to caching)
+        N_max = max(r.shape[0] for r in results)
+        T_max = max(r.shape[1] for r in results)
+        aligned = []
+        for r in results:
+            n, t = r.shape
+            if n < N_max or t < T_max:
+                padded = torch.zeros(N_max, T_max, device=r.device, dtype=r.dtype)
+                padded[:n, :t] = r
+                aligned.append(padded)
+            else:
+                aligned.append(r[:N_max, :T_max])
+
+        return torch.stack(aligned, dim=1), valid_names  # [N, F, T]
 
     def auto_discover(self):
         """Auto-register all FactorBase subclasses that have been imported."""

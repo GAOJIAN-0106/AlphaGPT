@@ -61,6 +61,14 @@ class FormulaEnsemble:
                 continue
             if res.std() < 1e-8:
                 continue
+            # Normalize shape: some ops produce extra dims
+            target_shape = feat_tensor.shape[0], feat_tensor.shape[2]  # [N, T]
+            if res.shape != target_shape:
+                while res.dim() > 2:
+                    res = res.squeeze(-1)
+                if res.dim() == 1:
+                    res = res.unsqueeze(-1)
+                res = res[:target_shape[0], :target_shape[1]]
             signals.append(res)
             valid_weights.append(self.weights[i])
 

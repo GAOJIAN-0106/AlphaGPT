@@ -80,6 +80,18 @@ ic_screening_v2.json
 feature_dim_comparison.json
 online_learning_results.json
 
+# Backtest results
+backtest_results*.json
+regime_ab_results.json
+wfr_quarterly_results.json
+
+# Ensemble search logs
+ensemble_run.log
+ensemble_search.log
+
+# TqSDK reference docs
+tqsdk-trading-and-data/
+
 # Cached high-frequency factor data
 *.parquet
 

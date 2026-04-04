@@ -25,29 +25,31 @@ FEATURES_V2_LIST = FEATURES_V1_LIST + [
 
 # V3 full: all registry factors (before IC screening)
 FEATURES_V3_FULL = FEATURES_V2_LIST + [
-    'TERM_SPREAD', 'PINDYCK_VOL', 'CARRY', 'BASIS', 'XS_MOM', 'AMIHUD_ILLIQ', 'MPB', 'VP_SKEW', 'BUY_WILL', 'TS_REGRESS', 'HEDGE_PRESS', 'NEAR_SUB_SPREAD', 'OVERNIGHT_GAP', 'VOL_ENTROPY_STD', 'LARGE_ORDER', 'ROBUST_MOM', 'OI_CHANGE_RATE', 'INTRADAY_RSI', 'INFLECTION', 'VOL_TIDE', 'JUMP_INTENSITY', 'TSMOM', 'SIGN_MOM', 'IVOL', 'RS_VOL', 'SHADOW_VOL', 'VOL_RATIO', 'DAZZLE_RET', 'INTRADAY_REV', 'INTRADAY_CVAR', 'AMB_VOL_CORR', 'RET_VOL_COV', 'OI_LEVEL', 'AB_NIGHT_REV', 'SALIENCE_RET', 'FOLLOW_CROWD', 'MA_ALIGN', 'ATTN_SPILL', 'BASIS_MOM', 'LONE_GOOSE', 'HURST', 'PRICE_OI_CORR', 'MORNING_FOG', 'PROSPECT_TK',
+    'TERM_SPREAD', 'PINDYCK_VOL', 'CARRY', 'BASIS', 'XS_MOM', 'AMIHUD_ILLIQ', 'MPB', 'VP_SKEW', 'BUY_WILL', 'TS_REGRESS', 'HEDGE_PRESS', 'NEAR_SUB_SPREAD', 'OVERNIGHT_GAP', 'VOL_ENTROPY_STD', 'LARGE_ORDER', 'ROBUST_MOM', 'OI_CHANGE_RATE', 'INTRADAY_RSI', 'INFLECTION', 'VOL_TIDE', 'JUMP_INTENSITY', 'TSMOM', 'SIGN_MOM', 'IVOL', 'RS_VOL', 'SHADOW_VOL', 'VOL_RATIO', 'DAZZLE_RET', 'INTRADAY_REV', 'INTRADAY_CVAR', 'AMB_VOL_CORR', 'RET_VOL_COV', 'OI_LEVEL', 'AB_NIGHT_REV', 'SALIENCE_RET', 'FOLLOW_CROWD', 'MA_ALIGN', 'ATTN_SPILL', 'BASIS_MOM', 'LONE_GOOSE', 'HURST', 'PRICE_OI_CORR', 'MORNING_FOG', 'PROSPECT_TK', 'MEMBER_LS', 'WAREHOUSE_CHG', 'INVENTORY_MOM', 'LS_STRENGTH', 'LONG_CONC_STD', 'FLOW_IN_RATIO', 'SHADING_TREE', 'OVERNIGHT_TREND', 'LRSR', 'TGD', 'BASIS_MOM_LOG', 'INV_LUNAR_YOY', 'IDEAL_AMP', 'NET_SUPPORT_VOL', 'RET_SKEW', 'SHORT_WEIGHTED',
 ]
 
-# V3: IC-screened 28-dim subset (hierarchical clustering + IC_IR > 0.05)
+# V3: IC-screened subset (hierarchical clustering |corr|>0.7 merged + ICIR > 0.05)
+# Re-screened 2026-04-01 with 77 candidate factors, top-20 by ICIR after dedup
+# Fixed at 20 factors for stable token mapping (quarterly incremental updates ±3 max)
 FEATURES_V3_LIST = [
-    # Base OHLCV (kept 8 of 12)
-    'DEV', 'LOG_VOL', 'VOL_CLUSTER', 'HL_RANGE', 'VOL_TREND',
-    # Intraday microstructure (kept 4 of 6)
-    'VWAP_DEV', 'VOL_SKEW', 'VOL_CONC',
-    # Registry: term structure (3)
-    'PINDYCK_VOL', 'CARRY', 'XS_MOM',
-    # Registry: momentum (3)
-    'ROBUST_MOM', 'OVERNIGHT_GAP', 'VOL_TIDE',
-    # Registry: volatility/jump (4)
-    'RS_VOL', 'SHADOW_VOL', 'JUMP_INTENSITY', 'AMB_VOL_CORR',
-    # Registry: microstructure (5)
-    'VP_SKEW', 'BUY_WILL', 'LARGE_ORDER', 'INTRADAY_RSI', 'INTRADAY_REV',
-    # Registry: volume profile (2)
-    'VOL_ENTROPY_STD', 'LONE_GOOSE',
-    # Registry: positioning (1)
-    'OI_LEVEL',
-    # Registry: other (2)
-    'AMIHUD_ILLIQ', 'MORNING_FOG',
+    # Intraday microstructure (5)
+    'TWAP_DEV', 'CLOSE_POS', 'SMART_MONEY', 'PRESSURE', 'OI_CHANGE',
+    # Volatility (4)
+    'INTRADAY_CVAR', 'VOL_TREND', 'VOL_SKEW', 'IVOL',
+    # Term structure (2)
+    'TERM_SPREAD', 'BASIS_MOM_LOG',
+    # Behavioral/sentiment (2)
+    'PROSPECT_TK', 'SALIENCE_RET',
+    # Price pattern (2)
+    'HL_RANGE', 'REL_STR',
+    # Liquidity (1)
+    'AMIHUD_ILLIQ',
+    # Order flow (2)
+    'LARGE_ORDER', 'NET_SUPPORT_VOL',
+    # Fundamental (1)
+    'TGD',
+    # Overnight (1)
+    'AB_NIGHT_REV',
 ]
 
 

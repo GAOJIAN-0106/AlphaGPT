@@ -28,6 +28,7 @@ from model_core.online_learner import OnlineLearner
 from model_core.vm import StackVM
 from model_core.backtest import MemeBacktest
 from model_core.duckdb_loader import DuckDBDataLoader
+from model_core.regime_detector import HMMRegimeDetector, get_returns_from_raw
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger('signal_gen')
@@ -42,7 +43,7 @@ def load_ensemble(path):
 
 
 def detect_regime(pnl_history, window=20, threshold=-0.5):
-    """Detect adverse regime from recent PnL.
+    """Legacy binary regime detection (kept for fallback).
 
     Returns scale factor: 1.0 = normal, 0.5 = adverse regime.
     """
@@ -56,6 +57,23 @@ def detect_regime(pnl_history, window=20, threshold=-0.5):
         log.warning(f"Adverse regime detected: 20d Sharpe = {rolling_sharpe:.2f}, reducing to 50%")
         return 0.5
     return 1.0
+
+
+def detect_regime_hmm(loader, regime_detector):
+    """HMM + volatility-based regime detection.
+
+    Uses cross-sectional market features (not PnL) for predictive
+    regime identification. Returns continuous scale in [0.3, 1.2].
+    """
+    raw = loader.raw_data_cache
+    returns = get_returns_from_raw(raw)
+    scale, info, label = regime_detector.update(returns)
+    log.info(f"Regime: {label} (scale={scale:.2f}, "
+             f"vol_ratio={info.get('vol_ratio', 0):.2f}, "
+             f"cross_corr={info.get('cross_corr', 0):.2f})")
+    if 'state_probs' in info:
+        log.info(f"  HMM probs: {info['state_probs']}")
+    return scale, info
 
 
 def update_mwu_weights(ensemble, loader, online_learner, lookback=10):
@@ -104,7 +122,8 @@ def update_mwu_weights(ensemble, loader, online_learner, lookback=10):
     log.info(f"  New weights:  {[f'{w:.3f}' for w in new_w]}")
 
 
-def generate_signals(ensemble, loader, online_learner=None):
+def generate_signals(ensemble, loader, online_learner=None, regime_detector=None,
+                     regime_mode='hmm_topn', topn=5):
     """Generate per-product target weights."""
     vm = StackVM()
     bt = MemeBacktest(position_mode='rank')
@@ -128,7 +147,9 @@ def generate_signals(ensemble, loader, online_learner=None):
     for i, formula in enumerate(ensemble.formulas):
         res = vm.execute(formula, latest_feat)
         if res is not None and res.std() > 1e-8:
-            formula_signals.append(res.squeeze(-1))  # [N]
+            while res.dim() > 1:
+                res = res[:, -1]  # Flatten extra dims by taking last column
+            formula_signals.append(res[:N])  # [N]
             formula_names.append(f"seed_{i}")
         else:
             formula_signals.append(torch.zeros(N))
@@ -149,19 +170,22 @@ def generate_signals(ensemble, loader, online_learner=None):
     ranks = ensemble_signal.argsort().argsort().float()
     rank_norm = (ranks / (N - 1) - 0.5) * 2  # [-1, 1]
 
-    # Regime detection from recent portfolio PnL
-    # Use last 20 days of ensemble signal PnL as proxy
-    recent_pnls = []
-    for t in range(max(0, T - 21), T - 1):
-        day_feat = feat[:, :, t:t+1]
-        sig = ensemble.predict(day_feat)
-        if sig is not None:
-            is_safe = torch.ones(N, 1, device=sig.device)
-            pos = bt.compute_position(sig, is_safe)
-            pnl = (pos * ret[:, t+1:t+2]).mean().item()
-            recent_pnls.append(pnl)
-
-    regime_scale = detect_regime(recent_pnls)
+    # Regime detection
+    regime_info = {}
+    if regime_detector is not None:
+        regime_scale, regime_info = detect_regime_hmm(loader, regime_detector)
+    else:
+        # Fallback to legacy binary detection
+        recent_pnls = []
+        for t in range(max(0, T - 21), T - 1):
+            day_feat = feat[:, :, t:t+1]
+            sig = ensemble.predict(day_feat)
+            if sig is not None:
+                is_safe = torch.ones(N, 1, device=sig.device)
+                pos = bt.compute_position(sig, is_safe)
+                pnl = (pos * ret[:, t+1:t+2]).mean().item()
+                recent_pnls.append(pnl)
+        regime_scale = detect_regime(recent_pnls)
 
     # Build output
     # Get product addresses from the data
@@ -205,11 +229,27 @@ def generate_signals(ensemble, loader, online_learner=None):
     # Sort by signal strength
     signals.sort(key=lambda x: x['signal_strength'], reverse=True)
 
+    # hmm_topn: adjust recommended topN by regime
+    regime_label = regime_info.get('hmm_label', regime_info.get('label', 'normal'))
+    if regime_mode == 'hmm_topn' and regime_detector is not None:
+        if regime_label == 'crisis':
+            recommended_topn = max(2, int(topn * regime_scale))
+        elif regime_label == 'calm':
+            recommended_topn = topn + 2
+        else:
+            recommended_topn = topn
+    else:
+        recommended_topn = topn
+
     output = {
         'date': datetime.now().strftime('%Y-%m-%d'),
         'timestamp': datetime.now().isoformat(),
         'ensemble_weights': weights.tolist() if isinstance(weights, np.ndarray) else weights,
         'regime_scale': regime_scale,
+        'regime_label': regime_label,
+        'regime_info': regime_info,
+        'regime_mode': regime_mode,
+        'recommended_topn': recommended_topn,
         'num_products': N,
         'num_long': sum(1 for s in signals if s['direction'] == 'LONG'),
         'num_short': sum(1 for s in signals if s['direction'] == 'SHORT'),
@@ -227,6 +267,11 @@ def main():
                         help='MWU online learner state (auto-created if missing)')
     parser.add_argument('--mwu-eta', type=float, default=0.05, help='MWU learning rate')
     parser.add_argument('--mwu-lookback', type=int, default=10, help='Days for MWU PnL computation')
+    parser.add_argument('--regime-state', default='signals/regime_state.json',
+                        help='HMM regime detector state (auto-created if missing)')
+    parser.add_argument('--regime-mode', default='hmm_topn',
+                        choices=['hmm', 'hmm_topn', 'legacy'],
+                        help='Regime detection mode: hmm_topn (default) / hmm / legacy')
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
@@ -234,9 +279,15 @@ def main():
     # Load ensemble
     ensemble, ens_data = load_ensemble(args.ensemble)
 
-    # Load data
+    # Load data (filter to active products to avoid dim mismatch)
     log.info("Loading data...")
-    loader = DuckDBDataLoader(timeframe='1d')
+    active_pids = None
+    latest_signal = os.path.join(args.output, 'latest.json')
+    if os.path.exists(latest_signal):
+        with open(latest_signal) as f:
+            prev = json.load(f)
+        active_pids = sorted(set(s['product'].split('.')[0] for s in prev.get('signals', [])))
+    loader = DuckDBDataLoader(timeframe='1d', products=active_pids)
     loader.load_data()
 
     # Load or create MWU online learner
@@ -252,19 +303,40 @@ def main():
                                         lookback_window=args.mwu_lookback, min_weight=0.02)
         log.info(f"Created new MWU learner: eta={args.mwu_eta}, equal weights")
 
+    # Load or create HMM regime detector
+    regime_detector = None
+    if args.regime_mode == 'hmm':
+        if os.path.exists(args.regime_state):
+            with open(args.regime_state) as f:
+                rd_data = json.load(f)
+            regime_detector = HMMRegimeDetector.from_dict(rd_data)
+            log.info(f"Loaded HMM regime state: {len(regime_detector._feature_buffer)} observations, "
+                     f"fitted={regime_detector._fitted}")
+        else:
+            regime_detector = HMMRegimeDetector(n_states=3, vol_window=20, refit_interval=20)
+            log.info("Created new HMM regime detector")
+
     # Step 1: Update MWU weights using recent realized PnL
     log.info("Updating MWU weights...")
     update_mwu_weights(ensemble, loader, online_learner, lookback=args.mwu_lookback)
 
     # Step 2: Generate signals with updated weights
     log.info("Generating signals with MWU weights...")
-    output = generate_signals(ensemble, loader, online_learner)
+    output = generate_signals(ensemble, loader, online_learner, regime_detector,
+                              regime_mode=args.regime_mode)
 
     # Step 3: Save MWU state for next run
     mwu_dict = online_learner.to_dict()
     with open(args.mwu_state, 'w') as f:
         json.dump(mwu_dict, f, indent=2)
     log.info(f"MWU state saved to {args.mwu_state}")
+
+    # Step 3b: Save regime detector state
+    if regime_detector is not None:
+        rd_dict = regime_detector.to_dict()
+        with open(args.regime_state, 'w') as f:
+            json.dump(rd_dict, f, indent=2)
+        log.info(f"Regime state saved to {args.regime_state}")
 
     # Save signals
     date_str = output['date']
@@ -278,7 +350,8 @@ def main():
 
     log.info(f"Signals saved: {out_path}")
     log.info(f"  Long: {output['num_long']}, Short: {output['num_short']}, Flat: {output['num_flat']}")
-    log.info(f"  Regime scale: {output['regime_scale']}")
+    log.info(f"  Regime: {output.get('regime_label', 'n/a')} (scale={output['regime_scale']:.2f})")
+    log.info(f"  Recommended topN: {output.get('recommended_topn', 5)}")
     log.info(f"  MWU weights: {[f'{w:.3f}' for w in online_learner.get_weights()]}")
 
     # Print top signals

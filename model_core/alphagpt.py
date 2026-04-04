@@ -228,9 +228,9 @@ class AlphaGPT(nn.Module):
         feat_dim = ModelConfig.get_feature_dim()
         max_len = ModelConfig.get_max_formula_len()
 
-        if feat_dim >= 21:
+        if feat_dim >= len(FEATURES_V3_LIST):
             self.features_list = FEATURES_V3_LIST
-        elif feat_dim == 18:
+        elif feat_dim >= len(FEATURES_V2_LIST):
             self.features_list = FEATURES_V2_LIST
         else:
             self.features_list = FEATURES_V1_LIST

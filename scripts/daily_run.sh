@@ -50,13 +50,25 @@ if [ $? -ne 0 ]; then
 fi
 log "Step 1: Done"
 
-# Step 2: Risk filter (Top-N small capital mode)
-log "Step 2: Applying risk filter (Top-${TOPN})..."
+# Step 2: Risk filter (Top-N, adjusted by regime)
+# Read recommended_topn from signals (hmm_topn regime detection)
+REGIME_TOPN=$($PYTHON -c "
+import json
+with open('${SIGNAL_DIR}/latest.json') as f:
+    d = json.load(f)
+print(d.get('recommended_topn', ${TOPN}))
+" 2>/dev/null || echo "$TOPN")
+log "Step 2: Applying risk filter (Top-${REGIME_TOPN}, regime: $($PYTHON -c "
+import json
+with open('${SIGNAL_DIR}/latest.json') as f:
+    d = json.load(f)
+print(d.get('regime_label', 'n/a'))
+" 2>/dev/null || echo 'n/a'))..."
 $PYTHON scripts/risk_filter.py \
     --input "${SIGNAL_DIR}/latest.json" \
     --capital "$CAPITAL" \
     --mode topn \
-    --topn "$TOPN" \
+    --topn "$REGIME_TOPN" \
     --output "${SIGNAL_DIR}/topn_signals.json" >> "$LOG_FILE" 2>&1
 if [ $? -ne 0 ]; then
     log "ERROR: Risk filter failed!"

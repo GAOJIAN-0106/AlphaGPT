@@ -107,6 +107,36 @@ def _op_cond_mul(condition: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     """
     return torch.sigmoid(condition) * x
 
+def _op_ewma(x: torch.Tensor, halflife: int) -> torch.Tensor:
+    """Exponentially weighted moving average.
+    Discovered via autoresearch-alpha (exp1, OOS Sharpe +0.16).
+    """
+    alpha = 1.0 - 0.5 ** (1.0 / halflife)
+    T = x.shape[1]
+    out = torch.zeros_like(x)
+    out[:, 0] = x[:, 0]
+    for t in range(1, T):
+        out[:, t] = alpha * x[:, t] + (1 - alpha) * out[:, t - 1]
+    return out
+
+
+def _op_breakout(x: torch.Tensor, window: int) -> torch.Tensor:
+    """Breakout signal: position within rolling [min, max] range, mapped to [-1, 1].
+    Positive = near recent high (breakout up), negative = near recent low.
+    Discovered via autoresearch-alpha (exp5, OOS Sharpe +0.33).
+    """
+    if x.shape[1] < window:
+        return torch.zeros_like(x)
+    pad_val = x[:, :1].expand(-1, window - 1)
+    x_pad = torch.cat([pad_val, x], dim=1)
+    unf = x_pad.unfold(1, window, 1)
+    roll_max = unf.max(dim=-1).values
+    roll_min = unf.min(dim=-1).values
+    rng = roll_max - roll_min + 1e-6
+    pos = (x - roll_min) / rng
+    return pos * 2.0 - 1.0
+
+
 OPS_CONFIG_EXTENDED = OPS_CONFIG + [
     ('CS_RANK',   _op_cs_rank,                     1),  # 12
     ('CS_DEMEAN', _op_cs_demean,                    1),  # 13
@@ -118,4 +148,8 @@ OPS_CONFIG_EXTENDED = OPS_CONFIG + [
     ('CORR10',    _op_corr10,                       2),  # 19
     ('IFELSE',    _op_ifelse,                       3),  # 20
     ('COND_MUL',  _op_cond_mul,                     2),  # 21
+    # --- autoresearch-alpha discoveries ---
+    ('EWMA5',     lambda x: _op_ewma(x, 5),         1),  # 22
+    ('EWMA10',    lambda x: _op_ewma(x, 10),        1),  # 23
+    ('BREAKOUT',  lambda x: _op_breakout(x, 20),     1),  # 24
 ]

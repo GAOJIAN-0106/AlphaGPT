@@ -69,12 +69,10 @@ class ModelConfig:
 
     @staticmethod
     def get_feature_dim():
-        # Intraday microstructure features (18-dim) only available for daily futures
-        # Term-structure factors extend to 21-dim when dual-contract data is available
+        # Dynamic: read from FEATURES_V3_LIST length for daily futures
         if ModelConfig.ASSET_CLASS == 'futures' and ModelConfig.TIMEFRAME == '1d':
-            if os.getenv('ENABLE_TERM_STRUCTURE', '1') == '1':
-                return 28  # IC-screened feature subset
-            return 18  # DuckDBFeatureEngineer only
+            from .features_v2 import FEATURES_V3_LIST
+            return len(FEATURES_V3_LIST)  # Currently 20 (re-screened 2026-04-01)
         return 12      # FeatureEngineer
 
     @staticmethod

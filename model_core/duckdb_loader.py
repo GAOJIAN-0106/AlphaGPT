@@ -29,7 +29,8 @@ class DuckDBDataLoader:
     """Load commodity futures data directly from DuckDB into tensors."""
 
     def __init__(self, train_ratio=0.7, timeframe: str = None,
-                 db_path: str = None, products: list = None):
+                 db_path: str = None, products: list = None,
+                 end_date: str = None, skip_ic_screening: bool = False):
         if duckdb is None:
             raise ImportError("duckdb is required. Run: pip install duckdb")
 
@@ -37,6 +38,8 @@ class DuckDBDataLoader:
         self.timeframe = timeframe or ModelConfig.TIMEFRAME
         self.db_path = db_path or self._default_db_path()
         self.products = products  # None = all
+        self.end_date = end_date  # None = all, 'YYYY-MM-DD' = up to date
+        self.skip_ic_screening = skip_ic_screening  # True = keep all features
 
         self.feat_tensor = None
         self.raw_data_cache = None
@@ -113,6 +116,8 @@ class DuckDBDataLoader:
 
             self.raw_data_cache['vwap_dev'] = (vwap_t - close_t) / (close_t + 1e-9)
             self.raw_data_cache['oi_change'] = oi_change_t
+            if 'total_oi' in df.columns:
+                self.raw_data_cache['total_oi'] = to_tensor('total_oi')
             self.raw_data_cache['vol_skew'] = am_vol_t / (pm_vol_t + 1e-9)
             self.raw_data_cache['vol_conc'] = max_30min_t / (volume_t + 1e-9)
             self.raw_data_cache['smart_money'] = last_hour_t / (first_hour_t + 1e-9)
@@ -136,6 +141,9 @@ class DuckDBDataLoader:
             # Inflection point ratio from 1min data
             if 'inflection_ratio' in df.columns:
                 self.raw_data_cache['inflection_ratio'] = to_tensor('inflection_ratio')
+            # Flow in ratio from 1min data
+            if 'flow_in_ratio' in df.columns:
+                self.raw_data_cache['flow_in_ratio'] = to_tensor('flow_in_ratio')
 
             self.feat_tensor = DuckDBFeatureEngineer.compute_features(self.raw_data_cache)
         else:
@@ -190,7 +198,17 @@ class DuckDBDataLoader:
                                  ('dazzle_cache.parquet', 'dazzle_ret'),
                                  ('hurst_cache.parquet', 'hurst'),
                                  ('price_oi_corr_cache.parquet', 'price_oi_corr'),
-                                 ('morning_fog_cache.parquet', 'morning_fog')]:
+                                 ('morning_fog_cache.parquet', 'morning_fog'),
+                                 ('member_pos_cache.parquet', 'ls_raw'),
+                                 ('warehouse_cache.parquet', 'warehouse'),
+                                 ('inventory_cache.parquet', 'inventory'),
+                                 ('long_conc_cache.parquet', 'long_conc_std'),
+                                 ('shading_tree_cache.parquet', 'shading_tree'),
+                                 ('tgd_cache.parquet', 'tgd'),
+                                 ('inv_lunar_yoy_cache.parquet', 'inv_lunar_yoy'),
+                                 ('net_support_vol_cache.parquet', 'net_support_vol'),
+                                 ('ret_skew_cache.parquet', 'ret_skew'),
+                                 ('short_weighted_cache.parquet', 'short_weighted')]:
             cache_file = _os.path.join(data_dir, cache_name)
             if _os.path.exists(cache_file):
                 try:
@@ -232,15 +250,22 @@ class DuckDBDataLoader:
                 T_reg = reg_tensor.shape[2]
                 N_main = self.feat_tensor.shape[0]
                 N_reg = reg_tensor.shape[0]
-                if T_reg >= T_main and N_reg >= N_main:
-                    reg_aligned = reg_tensor[:N_main, :, :T_main]
+                if T_reg >= T_main:
+                    if N_reg >= N_main:
+                        reg_aligned = reg_tensor[:N_main, :, :T_main]
+                    elif N_reg < N_main:
+                        # Pad missing products with zeros
+                        pad = torch.zeros(N_main - N_reg, reg_tensor.shape[1], T_main,
+                                          device=reg_tensor.device)
+                        reg_aligned = torch.cat(
+                            [reg_tensor[:, :, :T_main], pad], dim=0)
                     self.feat_tensor = torch.cat(
                         [self.feat_tensor, reg_aligned], dim=1)
                     print(f"Registry factors: +{len(reg_names)} dims "
                           f"({', '.join(reg_names)})")
                 else:
                     print(f"Warning: registry factor shape mismatch "
-                          f"({N_reg}x{T_reg} vs {N_main}x{T_main}), skipping")
+                          f"(T: {T_reg} vs {T_main}), skipping")
         except Exception as e:
             print(f"Warning: registry factor computation failed: {e}")
 
@@ -278,15 +303,16 @@ class DuckDBDataLoader:
 
         self.raw_data_cache['rebalance_mask'] = self.rebalance_mask
 
-        # IC-screened feature selection: keep only the 28 selected factors
-        from .features_v2 import FEATURES_V3_LIST, FEATURES_V3_FULL
-        if self.feat_tensor.shape[1] == len(FEATURES_V3_FULL):
-            full_names = FEATURES_V3_FULL
-            selected_names = FEATURES_V3_LIST
-            selected_indices = [full_names.index(n) for n in selected_names if n in full_names]
-            if selected_indices:
-                self.feat_tensor = self.feat_tensor[:, selected_indices, :]
-                print(f"IC screening: {len(full_names)} → {len(selected_indices)} features")
+        # IC-screened feature selection: keep only the selected factors
+        if not self.skip_ic_screening:
+            from .features_v2 import FEATURES_V3_LIST, FEATURES_V3_FULL
+            if self.feat_tensor.shape[1] == len(FEATURES_V3_FULL):
+                full_names = FEATURES_V3_FULL
+                selected_names = FEATURES_V3_LIST
+                selected_indices = [full_names.index(n) for n in selected_names if n in full_names]
+                if selected_indices:
+                    self.feat_tensor = self.feat_tensor[:, selected_indices, :]
+                    print(f"IC screening: {len(full_names)} → {len(selected_indices)} features")
 
         print(f"Data Ready. Shape: {self.feat_tensor.shape}")
 
@@ -308,11 +334,19 @@ class DuckDBDataLoader:
     def _query_main_contracts(self, con, minutes, limit_tokens):
         """Query DuckDB for main-contract OHLCV, optionally aggregated."""
 
-        # Product filter
+        # Product filter — applied in daily_oi CTE and in outer queries
         product_filter = ""
+        daily_oi_filter = ""
         if self.products:
             plist = ", ".join(f"'{p}'" for p in self.products)
-            product_filter = f"AND k.product_id IN ({plist})"
+            product_filter = ""  # Filtering done in daily_oi CTE
+            daily_oi_filter = f"WHERE product_id IN ({plist})"
+        if self.end_date:
+            date_clause = f"AND datetime <= '{self.end_date} 23:59:59'"
+            if daily_oi_filter:
+                daily_oi_filter += f" {date_clause}"
+            else:
+                daily_oi_filter = f"WHERE datetime <= '{self.end_date} 23:59:59'"
 
         # Main contract CTE (per product per day, pick highest avg close_oi)
         main_cte = f"""
@@ -321,6 +355,7 @@ class DuckDBDataLoader:
                        DATE_TRUNC('day', datetime) as day,
                        AVG(close_oi) as avg_oi
                 FROM kline_1min
+                {daily_oi_filter}
                 GROUP BY product_id, exchange, symbol, day
             ),
             main_contracts AS (
@@ -365,6 +400,27 @@ class DuckDBDataLoader:
                         AND DATE_TRUNC('day', k4.datetime) = mc4.day
                     WHERE mc4.rn = 1 {product_filter}
                     GROUP BY mc4.product_id || '.' || mc4.exchange, mc4.day
+                ),
+                flow_in_bars AS (
+                    SELECT mc7.product_id || '.' || mc7.exchange as address,
+                           mc7.day,
+                           k7.volume::DOUBLE as vol,
+                           k7.close::DOUBLE as cls,
+                           LAG(k7.close) OVER (
+                               PARTITION BY mc7.product_id, k7.symbol, mc7.day
+                               ORDER BY k7.datetime) as prev_close
+                    FROM main_contracts mc7
+                    JOIN kline_1min k7 ON k7.symbol = mc7.symbol
+                        AND DATE_TRUNC('day', k7.datetime) = mc7.day
+                    WHERE mc7.rn = 1 {product_filter}
+                ),
+                flow_in AS (
+                    SELECT address, day,
+                           SUM(vol * cls * SIGN(cls - prev_close))
+                               / NULLIF(SUM(vol * cls), 0) as flow_in_ratio
+                    FROM flow_in_bars
+                    WHERE prev_close IS NOT NULL
+                    GROUP BY address, day
                 ),
                 inflect_bars AS (
                     SELECT mc6.product_id || '.' || mc6.exchange as address,
@@ -432,6 +488,7 @@ class DuckDBDataLoader:
                     -- Intraday microstructure columns
                     SUM(k.volume * k.close) / NULLIF(SUM(k.volume), 0) as vwap,
                     LAST(k.close_oi ORDER BY k.datetime) - FIRST(k.close_oi ORDER BY k.datetime) as oi_change,
+                    LAST(k.close_oi ORDER BY k.datetime)::DOUBLE as total_oi,
                     SUM(CASE WHEN EXTRACT(HOUR FROM k.datetime) < 13 THEN k.volume ELSE 0 END)::DOUBLE as am_volume,
                     SUM(CASE WHEN EXTRACT(HOUR FROM k.datetime) >= 13 THEN k.volume ELSE 0 END)::DOUBLE as pm_volume,
                     mv.max_30min_vol,
@@ -452,7 +509,9 @@ class DuckDBDataLoader:
                     SUM(CASE WHEN k.close > k.open THEN k.volume ELSE 0 END)::DOUBLE
                         / NULLIF(SUM(CASE WHEN k.close <= k.open THEN k.volume ELSE 0 END), 0) as vol_ratio,
                     -- Inflection point ratio (via inflect CTE)
-                    inflect_cte.inflection_ratio
+                    inflect_cte.inflection_ratio,
+                    -- Flow in ratio from 1min data (via flow_in CTE)
+                    flow_in_cte.flow_in_ratio
                 FROM main_contracts mc
                 JOIN kline_1min k ON k.symbol = mc.symbol
                     AND DATE_TRUNC('day', k.datetime) = mc.day
@@ -466,8 +525,10 @@ class DuckDBDataLoader:
                     AND rsi_cte.day = mc.day
                 LEFT JOIN inflect inflect_cte ON inflect_cte.address = mc.product_id || '.' || mc.exchange
                     AND inflect_cte.day = mc.day
+                LEFT JOIN flow_in flow_in_cte ON flow_in_cte.address = mc.product_id || '.' || mc.exchange
+                    AND flow_in_cte.day = mc.day
                 WHERE mc.rn = 1 {product_filter}
-                GROUP BY mc.product_id || '.' || mc.exchange, mc.day, mv.max_30min_vol, vp.vsp_price, vp90.vol_p90, rsi_cte.intraday_rsi, inflect_cte.inflection_ratio
+                GROUP BY mc.product_id || '.' || mc.exchange, mc.day, mv.max_30min_vol, vp.vsp_price, vp90.vol_p90, rsi_cte.intraday_rsi, inflect_cte.inflection_ratio, flow_in_cte.flow_in_ratio
                 ORDER BY address, time
             """
         elif minutes == 1:
